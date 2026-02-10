@@ -1,6 +1,5 @@
 from typing import Optional, Callable
 from typing_extensions import Unpack, Tuple
-import time
 import torch
 from torch import nn
 from transformers.models.qwen3.modeling_qwen3 import (
@@ -161,6 +160,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.fc = nn.Linear(len(self.target_layer_ids) * config.hidden_size, config.hidden_size, bias=False)
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.block_size = config.block_size
+        self.mask_token_id = self.config.dflash_config.get("mask_token_id", None)
         self.post_init()
 
     def forward(
@@ -189,31 +189,23 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             )
         return self.norm(hidden_states)
     
-    def _sync(self, device):
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-
     @torch.inference_mode()
     def spec_generate(
         self,
         target: nn.Module,
         input_ids: torch.LongTensor,
-        mask_token_id: int,
         max_new_tokens: int,
         stop_token_ids: list[int],
         temperature: float,
-        print_stats: bool = True,
-        return_stats: bool = False,
     ):
-        self.eval()
-        device = next(self.parameters()).device
+        self.eval() 
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
 
         block_size = self.block_size
         output_ids = torch.full(
             (1, max_length + block_size),
-            mask_token_id,
+            self.mask_token_id,
             dtype=torch.long,
             device=target.device,
         )
@@ -222,18 +214,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         past_key_values_target = DynamicCache()
         past_key_values_draft = DynamicCache()
 
-        # --- Stage timings (wall-clock ms) ---
-        t_prefill_target = 0.0
-        t_embed_list = []
-        t_draft_list = []
-        t_lm_head_list = []
-        t_target_verify_list = []
-        t_postproc_list = []
-        t_total_start = time.perf_counter()
-
         # Prefill stage
-        self._sync(device)
-        t0 = time.perf_counter()
         output = target(
             input_ids,
             position_ids=position_ids[:, :num_input_tokens],
@@ -242,8 +223,6 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             logits_to_keep=1,
             output_hidden_states=True,
         )
-        self._sync(device)
-        t_prefill_target = (time.perf_counter() - t0) * 1000.0
 
         output_ids[:, :num_input_tokens] = input_ids
         output_ids[:, num_input_tokens:num_input_tokens+1] = sample(output.logits, temperature)
@@ -252,45 +231,21 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         # Decode stage
         acceptance_lengths = []
         start = input_ids.shape[1]
-        num_decode_steps = 0
         while start < max_length:
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[:, start : start + block_size]
-
-            # embed
-            self._sync(device)
-            t0 = time.perf_counter()
             noise_embedding = target.model.embed_tokens(block_output_ids)
-            self._sync(device)
-            t_embed_list.append((time.perf_counter() - t0) * 1000.0)
-
-            # draft (dflash forward)
-            self._sync(device)
-            t0 = time.perf_counter()
-            draft_hidden = self(
+            draft_logits = target.lm_head(self(
                 target_hidden=target_hidden,
                 noise_embedding=noise_embedding,
                 position_ids=position_ids[:, past_key_values_draft.get_seq_length(): start + block_size],
                 past_key_values=past_key_values_draft,
                 use_cache=True,
                 is_causal=False,
-            )[:, -block_size+1:, :]
-            self._sync(device)
-            t_draft_list.append((time.perf_counter() - t0) * 1000.0)
-
-            # lm_head
-            self._sync(device)
-            t0 = time.perf_counter()
-            draft_logits = target.lm_head(draft_hidden)
-            self._sync(device)
-            t_lm_head_list.append((time.perf_counter() - t0) * 1000.0)
-
+            )[:, -block_size+1:, :])
             past_key_values_draft.crop(start)
             block_output_ids[:, 1:] = sample(draft_logits)
 
-            # target verify
-            self._sync(device)
-            t0 = time.perf_counter()
             output = target(
                 block_output_ids,
                 position_ids=block_position_ids,
@@ -298,12 +253,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 use_cache=True,
                 output_hidden_states=True,
             )
-            self._sync(device)
-            t_target_verify_list.append((time.perf_counter() - t0) * 1000.0)
 
-            # postproc (sample + acceptance)
-            self._sync(device)
-            t0 = time.perf_counter()
             posterior = sample(output.logits, temperature)
             acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
             output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
@@ -311,84 +261,17 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             start += acceptance_length + 1
             past_key_values_target.crop(start)
             target_hidden = extract_context_feature(output.hidden_states, self.target_layer_ids)[:, :acceptance_length + 1, :]
-            acceptance_lengths.append(acceptance_length + 1)
-            self._sync(device)
-            t_postproc_list.append((time.perf_counter() - t0) * 1000.0)
-
-            num_decode_steps += 1
+            acceptance_lengths.append(acceptance_length+1)
             if stop_token_ids is not None and any(
                 stop_token_id in output_ids[:, num_input_tokens:] for stop_token_id in stop_token_ids
             ):
                 break
-
-        t_total_end = time.perf_counter()
-        total_generate_ms = (t_total_end - t_total_start) * 1000.0
-
         output_ids = output_ids[:, :max_length]
-        output_ids = output_ids[:, output_ids[0] != mask_token_id]
+        output_ids = output_ids[:, output_ids[0] != self.mask_token_id]
         if stop_token_ids is not None:
-            stop_token_ids_t = torch.tensor(stop_token_ids, device=output_ids.device)
-            stop_token_indices = torch.isin(output_ids[0][num_input_tokens:], stop_token_ids_t).nonzero(as_tuple=True)[0]
+            stop_token_ids = torch.tensor(stop_token_ids, device=output_ids.device)
+            stop_token_indices = torch.isin(output_ids[0][num_input_tokens:], stop_token_ids).nonzero(as_tuple=True)[0]
             if stop_token_indices.numel() > 0:
                 output_ids = output_ids[:, : num_input_tokens + stop_token_indices[0] + 1]
-
-        generated_tokens = output_ids.shape[1] - num_input_tokens
-        draft_accepted = sum(acceptance_lengths) - len(acceptance_lengths)  # draft tokens only (exclude 1 target per step)
-        target_only_steps = sum(1 for al in acceptance_lengths if al == 1)  # steps where only target token taken
-        avg_accept_per_block = sum(acceptance_lengths) / len(acceptance_lengths) if acceptance_lengths else 0.0
-        ttft_ms = t_prefill_target
-        tpot_ms = total_generate_ms / generated_tokens if generated_tokens else 0.0
-        throughput = (generated_tokens / (total_generate_ms / 1000.0)) if total_generate_ms > 0 else 0.0
-
-        stats = {
-            "generated_tokens": generated_tokens,
-            "total_generate_ms": total_generate_ms,
-            "throughput": throughput,
-            "ttft_ms": ttft_ms,
-            "tpot_ms": tpot_ms,
-            "acceptance_lengths": acceptance_lengths,
-        }
-
-        if print_stats:
-            print(f"dflash_cfg.block_size is {block_size}")
-            print(f"target_layer_ids is")
-            print(" ".join(map(str, self.target_layer_ids)))
-            print(
-                f"[Tokens] prompt={num_input_tokens}, generated={generated_tokens}, "
-                f"draft_accepted={draft_accepted}, target_only={target_only_steps}, "
-                f"avg_accept_per_block={avg_accept_per_block:.3f}"
-            )
-            print(
-                f"[Latency] TTFT={ttft_ms:.3f} ms, TPOT={tpot_ms:.3f} ms/token, "
-                f"total_generate={total_generate_ms:.3f} ms, throughput={throughput:.3f} tokens/s"
-            )
-            sum_embed = sum(t_embed_list)
-            sum_draft = sum(t_draft_list)
-            sum_lm_head = sum(t_lm_head_list)
-            sum_target_verify = sum(t_target_verify_list)
-            sum_postproc = sum(t_postproc_list)
-            n_run = len(t_embed_list)
-            print("[Stage timings] wall-clock (ms):")
-            print(f"  prefill target: wall {t_prefill_target:.3f} ms (max {t_prefill_target:.3f}, 1 runs)")
-            print(f"  target ctx: wall 0.000 ms (max 0.000, 0 runs)")
-            max_embed = max(t_embed_list) if t_embed_list else 0.0
-            max_draft = max(t_draft_list) if t_draft_list else 0.0
-            max_lm = max(t_lm_head_list) if t_lm_head_list else 0.0
-            max_verify = max(t_target_verify_list) if t_target_verify_list else 0.0
-            max_post = max(t_postproc_list) if t_postproc_list else 0.0
-            print(f"  embed: wall {sum_embed:.3f} ms (max {max_embed:.3f}, {n_run} runs)")
-            print(f"  draft: wall {sum_draft:.3f} ms (max {max_draft:.3f}, {n_run} runs)")
-            print(f"  lm_head: wall {sum_lm_head:.3f} ms (max {max_lm:.3f}, {n_run} runs)")
-            print(f"  target verify: wall {sum_target_verify:.3f} ms (max {max_verify:.3f}, {len(t_target_verify_list)} runs)")
-            print("  prep: wall 0.000 ms (max 0.000, 0 runs)")
-            print(f"  postproc: wall {sum_postproc:.3f} ms (max {max_post:.3f}, {n_run} runs)")
-            print("  kv trim: wall 0.000 ms (max 0.000, 0 runs)")
-            print("  hidden append: wall 0.000 ms (max 0.000, 0 runs)")
-            print("  set_tensor: wall 0.000 ms (max 0.000, 0 runs)")
-            print("  get_tensor: wall 0.000 ms (max 0.000, 0 runs)")
-            print("  argmax: wall 0.000 ms (max 0.000, 0 runs)")
-            print("  make_tensor: wall 0.000 ms (max 0.000, 0 runs)")
-            print("  other (untracked): wall 0.000 ms (max 0.000, 0 runs)")
-            print(f"[Draft acceptance per step] {acceptance_lengths}")
-
-        return (output_ids, stats) if return_stats else output_ids
+                
+        return output_ids

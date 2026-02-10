@@ -1,0 +1,9 @@
+# Byte-compiled / cached
+__pycache__/
+
+# Model / data directories
+Qwen3-4B/
+Qwen3-4B-DFlash-b16/
+
+# Logs
+logs/

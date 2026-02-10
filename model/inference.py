@@ -5,7 +5,7 @@ from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 # 1. Load the DFlash Draft Model
 # Note: trust_remote_code=True is required for DFlash. We recommend run on one GPU currently.
 model = AutoModel.from_pretrained(
-    "./models/Qwen3-4B-DFlash-b16", 
+    "./Qwen3-4B-DFlash-b16", 
     trust_remote_code=True, 
     dtype="bfloat16", 
     device_map="cuda"
@@ -13,7 +13,7 @@ model = AutoModel.from_pretrained(
 
 # 2. Load the Target Model
 target = AutoModelForCausalLM.from_pretrained(
-    "./models/Qwen3-4B", 
+    "./Qwen3-4B", 
     dtype="bfloat16", 
     device_map="cuda"
 ).eval()
